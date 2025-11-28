@@ -6,7 +6,7 @@ const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
   : null;
 
-const MODEL_NAME = 'gemini-pro';
+const MODEL_NAME = 'gemini-2.5-flash';
 
 /**
  * Generate AI summary from user's reports

@@ -2,6 +2,7 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 const { auth, db } = require('../config/firebase');
 const { asyncHandler } = require('../middleware/errorHandler');
+const axios = require('axios');
 
 const router = express.Router();
 
@@ -107,17 +108,26 @@ router.post('/patient/login', [
   const { email, password } = req.body;
 
   try {
-    // Note: Firebase Admin SDK doesn't support password verification
-    // The client should use Firebase Auth SDK to authenticate
-    // Then send the ID token to this endpoint for verification
-    // For this endpoint, we'll verify the user exists and is a patient
-    // In production, this should use Firebase Auth REST API or client SDK
-    
-    // Get user by email
-    const userRecord = await auth.getUserByEmail(email);
+    // Verify credentials using Firebase Auth REST API
+    const firebaseApiKey = process.env.FIREBASE_WEB_API_KEY;
+    if (!firebaseApiKey) {
+      throw new Error('FIREBASE_WEB_API_KEY environment variable is not set');
+    }
+
+    // Authenticate with Firebase Auth REST API
+    const authResponse = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseApiKey}`,
+      {
+        email,
+        password,
+        returnSecureToken: true
+      }
+    );
+
+    const { localId: userId, idToken } = authResponse.data;
 
     // Verify user document exists and is a patient
-    const userDoc = await db.collection('users').doc(userRecord.uid).get();
+    const userDoc = await db.collection('users').doc(userId).get();
     
     if (!userDoc.exists) {
       return res.status(401).json({
@@ -144,20 +154,36 @@ router.post('/patient/login', [
     }
 
     // Generate custom token for client to exchange for ID token
-    const customToken = await auth.createCustomToken(userRecord.uid);
+    const customToken = await auth.createCustomToken(userId);
 
     res.json({
       success: true,
       data: {
         token: customToken,
-        userId: userRecord.uid,
-        email: userRecord.email,
+        userId: userId,
+        email: email,
         name: userData.name,
         role: userData.role
       }
     });
   } catch (error) {
     console.error('Patient login error:', error);
+
+    if (error.response?.data?.error) {
+      const firebaseError = error.response.data.error;
+      if (firebaseError.message === 'INVALID_PASSWORD' || 
+          firebaseError.message === 'EMAIL_NOT_FOUND' ||
+          firebaseError.message === 'INVALID_EMAIL') {
+        return res.status(401).json({
+          success: false,
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'Invalid email or password',
+            details: {}
+          }
+        });
+      }
+    }
 
     if (error.code === 'auth/user-not-found') {
       return res.status(401).json({
@@ -302,11 +328,26 @@ router.post('/doctor/login', [
   const { email, password } = req.body;
 
   try {
-    // Get user by email
-    const userRecord = await auth.getUserByEmail(email);
+    // Verify credentials using Firebase Auth REST API
+    const firebaseApiKey = process.env.FIREBASE_WEB_API_KEY;
+    if (!firebaseApiKey) {
+      throw new Error('FIREBASE_WEB_API_KEY environment variable is not set');
+    }
+
+    // Authenticate with Firebase Auth REST API
+    const authResponse = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseApiKey}`,
+      {
+        email,
+        password,
+        returnSecureToken: true
+      }
+    );
+
+    const { localId: userId, idToken } = authResponse.data;
 
     // Verify user document exists and is a doctor
-    const userDoc = await db.collection('users').doc(userRecord.uid).get();
+    const userDoc = await db.collection('users').doc(userId).get();
     
     if (!userDoc.exists) {
       return res.status(401).json({
@@ -333,20 +374,36 @@ router.post('/doctor/login', [
     }
 
     // Generate custom token for client to exchange for ID token
-    const customToken = await auth.createCustomToken(userRecord.uid);
+    const customToken = await auth.createCustomToken(userId);
 
     res.json({
       success: true,
       data: {
         token: customToken,
-        userId: userRecord.uid,
-        email: userRecord.email,
+        userId: userId,
+        email: email,
         name: userData.name,
         role: userData.role
       }
     });
   } catch (error) {
     console.error('Doctor login error:', error);
+
+    if (error.response?.data?.error) {
+      const firebaseError = error.response.data.error;
+      if (firebaseError.message === 'INVALID_PASSWORD' || 
+          firebaseError.message === 'EMAIL_NOT_FOUND' ||
+          firebaseError.message === 'INVALID_EMAIL') {
+        return res.status(401).json({
+          success: false,
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'Invalid email or password',
+            details: {}
+          }
+        });
+      }
+    }
 
     if (error.code === 'auth/user-not-found') {
       return res.status(401).json({

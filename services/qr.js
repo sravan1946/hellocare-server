@@ -207,7 +207,7 @@ async function getReportsByQRToken(qrToken) {
           fileType: reportData.fileType,
           title: reportData.title,
           reportDate: reportData.reportDate,
-          s3Url: reportData.s3Url
+          storageUrl: reportData.storageUrl
         });
       }
     }
