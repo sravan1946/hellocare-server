@@ -6,6 +6,7 @@ const { db, admin } = require('../config/firebase');
 const { generateUploadUrl, generateDownloadUrl, exportReports } = require('../services/storage');
 const { processDocumentAsync } = require('../services/ocr');
 const { generateQRToken, validateQRToken, generateQRCodeImage, getReportsByQRToken } = require('../services/qr');
+const { generateSummaryForReports } = require('../services/ai');
 
 const router = express.Router();
 
@@ -452,6 +453,22 @@ router.post('/qr/generate', authenticateToken, [
     // Generate QR token
     const { qrToken, expiresAt } = await generateQRToken(reportIds, expiresIn, userId);
 
+    // Generate AI summary for selected reports (async, don't block QR generation)
+    let aiSummary = null;
+    try {
+      const summaryResult = await generateSummaryForReports(reportIds);
+      aiSummary = summaryResult.summary;
+      
+      // Store summary in QR token document
+      await db.collection('qrTokens').doc(qrToken).update({
+        aiSummary: aiSummary,
+        summaryGeneratedAt: summaryResult.generatedAt
+      });
+    } catch (error) {
+      console.error('Error generating AI summary for QR code:', error);
+      // Continue without summary - QR code generation should not fail if summary fails
+    }
+
     // Generate QR code image
     const qrCode = await generateQRCodeImage(qrToken);
 
@@ -460,7 +477,8 @@ router.post('/qr/generate', authenticateToken, [
       data: {
         qrToken,
         qrCode,
-        expiresAt
+        expiresAt,
+        aiSummary: aiSummary // Include summary in response if available
       }
     });
   } catch (error) {
