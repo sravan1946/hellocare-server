@@ -14,7 +14,7 @@ try { ajv = require('ajv')(); } catch (e) { /* ajv not installed, we'll fallback
 
 // --- Google Gemini Configuration ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MODEL_NAME = 'gemini-3-pro-preview'; // Using Gemini 3.0 Pro (latest stable model)
+const MODEL_NAME = 'gemini-2.5-flash'; // Using Gemini 3.0 Pro (latest stable model)
 
 // Initialize Gemini client
 let genAI = null;
