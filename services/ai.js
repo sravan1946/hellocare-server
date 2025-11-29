@@ -7,6 +7,7 @@
 
 const { db } = require('../config/firebase'); // keep your existing firebase config path
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const crypto = require('crypto');
 
 // Optional validator (AJV). If not installed, code still works with a lightweight fallback.
 let ajv = null;
@@ -25,8 +26,10 @@ if (GEMINI_API_KEY) {
 // --- API Constants ---
 const DEFAULT_BATCH_SIZE = 5; 
 const MAX_SUGGESTIONS_REPORTS = 5; 
-const API_CALL_TIMEOUT_MS = 30000; // Increased timeout for larger HF models
+const API_CALL_TIMEOUT_MS = 60000; // Increased timeout to 60 seconds for complex summaries
 const MODEL_CALL_RETRIES = 2;
+const CACHE_TTL_HOURS = 24; // Cache summary for 24 hours
+const CACHE_COLLECTION = 'aiSummaries';
 
 // ------------------ Integrated System Prompt ------------------
 const HEALTH_REPORT_ANALYST_SYSTEM_PROMPT = `
@@ -305,6 +308,124 @@ const suggestionsSchema = {
 let validateSuggestions = null;
 if (ajv) validateSuggestions = ajv.compile(suggestionsSchema);
 
+// ---------- Cache Helper Functions ----------
+
+/**
+ * Generate cache key for summary based on userId and report identifiers
+ * @param {string} userId - User ID
+ * @param {Array<string>|null} reportIds - Optional array of report IDs
+ * @param {Date|string|null} lastReportDate - Optional last report date
+ * @returns {string} Cache key
+ */
+function generateCacheKey(userId, reportIds = null, lastReportDate = null) {
+  const parts = [userId];
+  
+  if (reportIds && Array.isArray(reportIds) && reportIds.length > 0) {
+    // Sort report IDs for consistent hashing
+    const sortedIds = [...reportIds].sort().join(',');
+    parts.push(`reports:${sortedIds}`);
+  }
+  
+  if (lastReportDate) {
+    const dateStr = lastReportDate instanceof Date 
+      ? lastReportDate.toISOString() 
+      : String(lastReportDate);
+    parts.push(`date:${dateStr}`);
+  }
+  
+  const keyString = parts.join('|');
+  return crypto.createHash('sha256').update(keyString).digest('hex');
+}
+
+/**
+ * Get cached summary from Firestore
+ * @param {string} cacheKey - Cache key
+ * @returns {Promise<Object|null>} Cached summary or null if not found/expired
+ */
+async function getCachedSummary(cacheKey) {
+  try {
+    const cacheDoc = await db.collection(CACHE_COLLECTION).doc(cacheKey).get();
+    
+    if (!cacheDoc.exists) {
+      return null;
+    }
+    
+    const cacheData = cacheDoc.data();
+    const now = new Date();
+    const expiresAt = cacheData.expiresAt?.toDate ? cacheData.expiresAt.toDate() : new Date(cacheData.expiresAt);
+    
+    // Check if cache is expired
+    if (expiresAt < now) {
+      // Delete expired cache
+      await db.collection(CACHE_COLLECTION).doc(cacheKey).delete();
+      return null;
+    }
+    
+    return {
+      summary: cacheData.summary,
+      generatedAt: cacheData.generatedAt,
+      reportCount: cacheData.reportCount,
+      lastReportDate: cacheData.lastReportDate || null
+    };
+  } catch (error) {
+    console.error('Error getting cached summary:', error);
+    return null; // Return null on error to allow fresh generation
+  }
+}
+
+/**
+ * Store summary in cache
+ * @param {string} cacheKey - Cache key
+ * @param {string} userId - User ID
+ * @param {Object} summaryData - Summary data to cache
+ * @returns {Promise<void>}
+ */
+async function setCachedSummary(cacheKey, userId, summaryData) {
+  try {
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + CACHE_TTL_HOURS * 60 * 60 * 1000);
+    
+    await db.collection(CACHE_COLLECTION).doc(cacheKey).set({
+      userId: userId,
+      summary: summaryData.summary,
+      generatedAt: summaryData.generatedAt,
+      reportCount: summaryData.reportCount || 0,
+      lastReportDate: summaryData.lastReportDate || null,
+      expiresAt: expiresAt,
+      cachedAt: now
+    }, { merge: true });
+  } catch (error) {
+    console.error('Error caching summary:', error);
+    // Don't throw - caching failure shouldn't break the request
+  }
+}
+
+/**
+ * Invalidate cache for a user (when new reports are added)
+ * @param {string} userId - User ID
+ * @returns {Promise<void>}
+ */
+async function invalidateUserCache(userId) {
+  try {
+    // Delete all cache entries for this user
+    const cacheSnapshot = await db.collection(CACHE_COLLECTION)
+      .where('userId', '==', userId)
+      .get();
+    
+    const batch = db.batch();
+    cacheSnapshot.docs.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+    
+    if (cacheSnapshot.docs.length > 0) {
+      await batch.commit();
+    }
+  } catch (error) {
+    console.error('Error invalidating user cache:', error);
+    // Don't throw - cache invalidation failure shouldn't break the request
+  }
+}
+
 // ---------- Public functions ----------
 
 /**
@@ -349,6 +470,20 @@ async function generateSummaryForReports(reportIds) {
       };
     }
 
+    // Get userId from first report (all reports should have same userId)
+    const userId = reports[0].userId;
+    if (!userId) {
+      throw new Error('Unable to determine user ID from reports');
+    }
+
+    // Check cache first
+    const cacheKey = generateCacheKey(userId, reportIds, null);
+    const cached = await getCachedSummary(cacheKey);
+    if (cached) {
+      console.log('Returning cached summary for reportIds:', reportIds);
+      return cached;
+    }
+
     const reportCount = reports.length;
 
     // If many reports, do progressive summarization
@@ -384,7 +519,12 @@ async function generateSummaryForReports(reportIds) {
 
     const summary = finalResp || 'Unable to generate summary at this time.';
 
-    return { summary, generatedAt: new Date().toISOString(), reportCount };
+    const result = { summary, generatedAt: new Date().toISOString(), reportCount };
+    
+    // Cache the result
+    await setCachedSummary(cacheKey, userId, result);
+    
+    return result;
   }
   catch (err) {
     console.error('generateSummaryForReports error:', err);
@@ -415,6 +555,14 @@ async function generateSummary(userId) {
     const reportCount = reports.length;
     const lastReportDate = reports[0].reportDate || null;
 
+    // Check cache first
+    const cacheKey = generateCacheKey(userId, null, lastReportDate);
+    const cached = await getCachedSummary(cacheKey);
+    if (cached) {
+      console.log('Returning cached summary for userId:', userId);
+      return cached;
+    }
+
     // If many reports, do progressive summarization
     const batches = chunkArray(reports, DEFAULT_BATCH_SIZE);
     const batchSummaries = [];
@@ -448,7 +596,12 @@ async function generateSummary(userId) {
 
     const summary = finalResp || 'Unable to generate summary at this time.';
 
-    return { summary, generatedAt: new Date().toISOString(), reportCount, lastReportDate };
+    const result = { summary, generatedAt: new Date().toISOString(), reportCount, lastReportDate };
+    
+    // Cache the result
+    await setCachedSummary(cacheKey, userId, result);
+    
+    return result;
   }
   catch (err) {
     console.error('generateSummary error:', err);
@@ -547,4 +700,4 @@ async function generateSuggestions(userId, reportId = null) {
   }
 }
 
-module.exports = { generateSummary, generateSuggestions, generateSummaryForReports };
+module.exports = { generateSummary, generateSuggestions, generateSummaryForReports, invalidateUserCache };
